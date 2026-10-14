@@ -1,0 +1,6 @@
+# Pilha única: PyTorch.
+torch>=2.9          # torch.optim.Muon exige 2.9+
+numpy
+pandas              # leitura dos CSVs de rodadas e do histórico
+matplotlib          # painel.pdf e slide.pdf do desafio3
+func_timeout        # usado pelo algoritmo genético
