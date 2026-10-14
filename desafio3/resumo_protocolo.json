@@ -1,0 +1,31 @@
+{
+  "melhores_lr": {
+    "sgd": 0.1,
+    "sgd_nesterov": 0.1,
+    "adam": 0.01,
+    "adamw": 0.01,
+    "muon": 0.03,
+    "rmsprop": 0.001
+  },
+  "otimizadores_etapa3": [
+    "adamw",
+    "muon"
+  ],
+  "top3": [
+    [
+      "adamw",
+      0.01,
+      "wsd"
+    ],
+    [
+      "adamw",
+      0.01,
+      "warmup_cosseno"
+    ],
+    [
+      "adamw",
+      0.01,
+      "cosseno"
+    ]
+  ]
+}
