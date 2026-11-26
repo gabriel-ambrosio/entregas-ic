@@ -13,7 +13,7 @@ using Il2CppAssets.Scripts.Unity.UI_New.InGame;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(RoundPlayerMod.RoundPlayer), "Player", "2.0.0", "Gabriel Valentin")]
+[assembly: MelonInfo(typeof(RoundPlayerMod.RoundPlayer), "Player", "2.1.0", "Gabriel Valentin")]
 [assembly: MelonGame("Ninja Kiwi", "BloonsTD6")]
 
 namespace RoundPlayerMod;
@@ -50,6 +50,7 @@ public class RoundPlayer : BloonsTD6Mod
     private const float PrazoJogo = 2f;                // segundos de JOGO (param quando pausado) para a simulação responder
     private const float PrazoMinimoReal = 1f;          // ...e pelo menos isto em segundos reais (jogo acelerado)
     private const float PrazoReal = 15f;               // limite em segundos reais, para nunca travar o lote
+    private const float PrazoReinicio = 8f;            // segundos reais para a partida voltar ao início, por tentativa
 
     // Tecla que lê o acoes.json e executa as ações (configurável nas opções do mod)
     public static readonly ModSettingHotkey TeclaLer = new(KeyCode.Return)
@@ -83,7 +84,21 @@ public class RoundPlayer : BloonsTD6Mod
     private bool _loteAberto;       // há um lote lido que ainda não teve o resultado salvo
     private long? _idLote;          // "id" do acoes.json, devolvido no resultado
     private bool _rodadaIniciada;   // o lote iniciou uma rodada (o Exportador exporta no fim dela)
-    private bool _reiniciou;        // o lote reiniciou a partida
+    private bool _reiniciou;        // o lote reiniciou a partida (confirmado)
+
+    private Reinicio? _reinicio;            // reinício em andamento, esperando a confirmação
+    private int _rodadaInicial = -1;        // GetCurrentRound() no começo da partida
+    private bool _capturarRodadaInicial;
+
+    // Reinício pedido: tenta um método de cada vez e só aceita quando a partida voltou mesmo ao início
+    private class Reinicio
+    {
+        public Resultado resultado = null!;
+        public int proximoMetodo;           // índice em MetodosDeReinicio
+        public int rodadaAntes;
+        public float prazo;
+        public string historico = "";
+    }
 
     private class Resultado
     {
@@ -108,6 +123,11 @@ public class RoundPlayer : BloonsTD6Mod
     // ---------- ciclo de vida ----------
     public override void OnMatchStart()
     {
+        _rodadaAtiva = false;
+        // Reinício em andamento: o lote continua aberto até a confirmação (não limpa nada)
+        if (_reinicio != null) return;
+
+        _capturarRodadaInicial = true;
         _fila.Clear();
         _resultados.Clear();
         _pendentes.Clear();
@@ -133,6 +153,12 @@ public class RoundPlayer : BloonsTD6Mod
     {
         if (InGame.instance?.bridge == null) return;
 
+        if (_capturarRodadaInicial)
+        {
+            _capturarRodadaInicial = false;
+            try { _rodadaInicial = InGame.instance.bridge.GetCurrentRound(); } catch { }
+        }
+
         // Tecla: precisa ser conferida todo frame
         if (TeclaLer.JustPressed())
         {
@@ -145,6 +171,12 @@ public class RoundPlayer : BloonsTD6Mod
 
         if (Time.unscaledTime < _proximoPasso) return; // unscaled: funciona mesmo com o jogo pausado
         _proximoPasso = Time.unscaledTime + IntervaloEntrePassos;
+
+        if (_reinicio != null)
+        {
+            AcompanharReinicio();
+            return;
+        }
 
         if (!_loteAberto)
         {
@@ -266,7 +298,7 @@ public class RoundPlayer : BloonsTD6Mod
 
         if (nome == "reiniciar")
         {
-            ExecutarReinicio(r);
+            IniciarReinicio(r);
             return;
         }
 
@@ -319,37 +351,81 @@ public class RoundPlayer : BloonsTD6Mod
         else MelonLogger.Msg($"Ação #{r.indice} '{nome}' enviada ao jogo.");
     }
 
-    // Reinício: salva o resultado ANTES de qualquer coisa, porque o início da partida nova limpa o estado do mod
-    private void ExecutarReinicio(Resultado r)
+    // ---------- reinício da partida ----------
+    // O reinício só conta como feito quando o jogo mostra que voltou ao início
+    // (rodada inicial, nenhuma torre, vida > 0). Se um método não funcionar, tenta o próximo.
+    private void IniciarReinicio(Resultado r)
     {
-        long? id = _idLote;
-        var anteriores = new List<Resultado>(_resultados);
-
-        string? erro;
-        try { erro = ReiniciarNoJogo(); }
-        catch (Exception e) { erro = "exceção: " + (e.InnerException?.Message ?? e.Message); }
-
-        r.aceita = erro == null;
-        r.motivo = erro ?? "ok";
-
-        if (erro != null)
-        {
-            MelonLogger.Warning($"Ação #{r.indice} 'reiniciar' falhou: {erro}");
-            _resultados.Add(r);
-            return; // o lote continua e fecha normalmente
-        }
-
-        // O reinício pode ter disparado OnMatchStart e limpado as listas: remonta o que importa
         _fila.Clear();
         _pendentes.Clear();
-        _resultados.Clear();
-        _resultados.AddRange(anteriores);
-        _resultados.Add(r);
-        _idLote = id;
-        _reiniciou = true;
+        _reinicio = new Reinicio { resultado = r, rodadaAntes = RodadaAtual() };
+        TentarProximoMetodo();
+    }
+
+    private void TentarProximoMetodo()
+    {
+        var re = _reinicio!;
+        while (re.proximoMetodo < MetodosDeReinicio.Length)
+        {
+            var (nome, chamar) = MetodosDeReinicio[re.proximoMetodo++];
+            string? erro;
+            try { erro = chamar(); }
+            catch (Exception e) { erro = "exceção: " + (e.InnerException?.Message ?? e.Message); }
+
+            if (erro == null)
+            {
+                re.historico += $"{nome}: chamado, mas a partida não voltou ao início; ";
+                re.prazo = Time.unscaledTime + PrazoReinicio;
+                return; // AcompanharReinicio confere o efeito
+            }
+            re.historico += $"{nome}: {erro}; ";
+            MelonLogger.Warning($"Reinício por {nome} falhou: {erro}");
+        }
+        ConcluirReinicio(false);
+    }
+
+    private void AcompanharReinicio()
+    {
+        var re = _reinicio!;
+        if (PartidaVoltouAoInicio(re))
+            ConcluirReinicio(true);
+        else if (Time.unscaledTime > re.prazo)
+            TentarProximoMetodo();
+    }
+
+    private bool PartidaVoltouAoInicio(Reinicio re)
+    {
+        try
+        {
+            var jogo = InGame.instance;
+            int rodada = jogo.bridge.GetCurrentRound();
+            bool rodadaVoltou = _rodadaInicial >= 0
+                ? rodada <= _rodadaInicial
+                : rodada == 0 || rodada < re.rodadaAntes;
+            return rodadaVoltou && !jogo.GetTowers().Any() && jogo.GetHealth() > 0;
+        }
+        catch { return false; }
+    }
+
+    private static int RodadaAtual()
+    {
+        try { return InGame.instance.bridge.GetCurrentRound(); }
+        catch { return 0; }
+    }
+
+    private void ConcluirReinicio(bool ok)
+    {
+        var re = _reinicio!;
+        _reinicio = null;
+        re.resultado.aceita = ok;
+        re.resultado.motivo = ok ? "ok" : "a partida não reiniciou. Tentativas: " + re.historico;
+        _resultados.Add(re.resultado);
+        _reiniciou = ok;
         _rodadaAtiva = false;
         _loteAberto = true;
-        MelonLogger.Msg("Partida reiniciada.");
+
+        if (ok) MelonLogger.Msg("Partida reiniciada (confirmado).");
+        else MelonLogger.Warning($"Ação #{re.resultado.indice} 'reiniciar' falhou: {re.resultado.motivo}");
         FecharLote();
     }
 
@@ -607,25 +683,43 @@ public class RoundPlayer : BloonsTD6Mod
         InGame.instance.bridge.StartRound();
     }
 
-    // Reinicia a partida chamando InGame.Restart por reflexão, para funcionar mesmo que a
-    // assinatura mude entre versões (com ou sem parâmetros). A assinatura usada vai para o console.
-    private static string? ReiniciarNoJogo()
+    // Métodos de reinício, na ordem em que são tentados. Cada um devolve null se foi chamado
+    // (o efeito é conferido depois) ou o motivo de não ter sido possível chamar.
+    //  1) InGame.Restart: o mesmo do botão "Reiniciar" do jogo (também limpa a tela de fim).
+    //  2) bridge.Restart: reinicia só a simulação.
+    private static readonly (string nome, Func<string?> chamar)[] MetodosDeReinicio =
     {
-        var metodo = typeof(InGame).GetMethods(BindingFlags.Public | BindingFlags.Instance)
-            .Where(m => m.Name == "Restart")
+        ("InGame.Restart", () => ChamarRestart(InGame.instance, typeof(InGame))),
+        ("bridge.Restart", () => ChamarRestart(InGame.instance.bridge,
+            typeof(Il2CppAssets.Scripts.Unity.Bridge.UnityToSimulation))),
+    };
+
+    // Chama "Restart" por reflexão, para funcionar com ou sem parâmetros (a assinatura muda entre versões).
+    // Parâmetro bool com "save" no nome (removeSave) vai como true: false faz o jogo voltar do save
+    // em vez de recomeçar do zero.
+    private static string? ChamarRestart(object alvo, Type tipo)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+        var candidatos = tipo.GetMethods(flags).Where(m => m.Name.Contains("Restart")).ToList();
+        MelonLogger.Msg($"Métodos com 'Restart' em {tipo.Name}: " + (candidatos.Count == 0 ? "(nenhum)" :
+            string.Join(" | ", candidatos.Select(m => m.Name + "(" +
+                string.Join(", ", m.GetParameters().Select(prm => $"{prm.ParameterType.Name} {prm.Name}")) + ")"))));
+
+        var metodo = candidatos.Where(m => m.Name == "Restart")
             .OrderBy(m => m.GetParameters().Length)
             .FirstOrDefault();
-        if (metodo == null) return "método InGame.Restart não encontrado nesta versão do jogo";
+        if (metodo == null) return "método não existe nesta versão do jogo";
 
-        var argumentos = metodo.GetParameters()
-            .Select(prm => prm.HasDefaultValue
-                ? prm.DefaultValue
-                : prm.ParameterType.IsValueType ? Activator.CreateInstance(prm.ParameterType) : null)
-            .ToArray();
+        var argumentos = metodo.GetParameters().Select(prm =>
+        {
+            if (prm.ParameterType == typeof(bool) && (prm.Name ?? "").ToLowerInvariant().Contains("save"))
+                return (object?)true;
+            if (prm.HasDefaultValue) return prm.DefaultValue;
+            return prm.ParameterType.IsValueType ? Activator.CreateInstance(prm.ParameterType) : null;
+        }).ToArray();
 
-        MelonLogger.Msg("Reiniciando com InGame.Restart(" +
-                        string.Join(", ", metodo.GetParameters().Select(prm => $"{prm.ParameterType.Name} {prm.Name}")) + ")");
-        metodo.Invoke(InGame.instance, argumentos);
+        MelonLogger.Msg($"Chamando {tipo.Name}.Restart(" + string.Join(", ", argumentos.Select(a => a?.ToString() ?? "null")) + ")");
+        metodo.Invoke(alvo, argumentos);
         return null;
     }
 

@@ -223,9 +223,17 @@ class AmbienteBTD6(gym.Env):
         return self._observacao(), float(recompensa), self._terminou, False, info
 
     # ================================================================== início de episódio
-    @staticmethod
-    def _eh_inicio(e: Optional[Dict[str, Any]]) -> bool:
-        return bool(e) and e.get("inicio") is True and e.get("fase") == "decisao" and float(e.get("vida", 0)) > 0
+    def _eh_inicio(self, e: Optional[Dict[str, Any]]) -> bool:
+        """Estado de começo de partida de verdade: sem torres e dentro das rodadas do modo.
+        (Evita aceitar um "início" falso quando o jogo não reiniciou e seguiu para o freeplay.)"""
+        return (
+            bool(e)
+            and e.get("inicio") is True
+            and e.get("fase") == "decisao"
+            and float(e.get("vida", 0)) > 0
+            and not e.get("torres")
+            and int(e.get("proxima_rodada", 0)) <= self.cfg.rodada_final
+        )
 
     def _obter_estado_inicial(self) -> Dict[str, Any]:
         cfg = self.cfg
@@ -250,6 +258,9 @@ class AmbienteBTD6(gym.Env):
                 if self._eh_inicio(novo):
                     self._precisa_reiniciar = False
                     return novo
+                ultimo_erro = RuntimeError(
+                    f"o estado depois do reinício não é de começo de partida (rodada "
+                    f"{(novo or {}).get('proxima_rodada')}, {len((novo or {}).get('torres') or [])} torres)")
             except TempoEsgotado as e:
                 ultimo_erro = e
                 print(f"[ambiente] reinício sem resposta, tentando de novo: {e}")
